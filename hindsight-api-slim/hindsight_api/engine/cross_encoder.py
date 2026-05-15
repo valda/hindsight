@@ -1018,6 +1018,188 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     return enc.decode(tokens[:max_tokens])
 
 
+class LocalONNXCrossEncoder(CrossEncoderModel):
+    """
+    Local ONNX Runtime cross-encoder for cross-encoder models exported with
+    optimum-cli (e.g., hotchpotch/japanese-reranker-xsmall-v2).
+
+    Targets the same role as LocalSTCrossEncoder but skips PyTorch and uses
+    ONNX Runtime directly. Returns sigmoid-applied scores so the upstream
+    Hindsight `CrossEncoderReranker` (which sigmoids again) produces the
+    same calibration as the LocalSTCrossEncoder path.
+
+    Defaults are tuned for Ryzen CPU + xsmall model after the Step 1.9
+    microbench (intra_op=4, bucket_batching=True, batch_size=2). See
+    docs/plans/2026-05-15-reranker-onnx-latency-optimization.md (Step 2).
+    """
+
+    _executor: ThreadPoolExecutor | None = None
+    _max_concurrent: int = 2
+
+    def __init__(
+        self,
+        model_path: str,
+        tokenizer_name: str = "",
+        batch_size: int = 2,
+        intra_op_num_threads: int = 4,
+        inter_op_num_threads: int = 1,
+        bucket_batching: bool = True,
+        enable_cpu_mem_arena: bool = False,
+        max_concurrent: int = 2,
+        max_length: int = 512,
+    ):
+        if not model_path:
+            raise ValueError("LocalONNXCrossEncoder requires model_path")
+        self.model_path = model_path
+        self.tokenizer_name = tokenizer_name or os.path.dirname(model_path)
+        self.batch_size = batch_size
+        self.intra_op_num_threads = intra_op_num_threads
+        self.inter_op_num_threads = inter_op_num_threads
+        self.bucket_batching = bucket_batching
+        self.enable_cpu_mem_arena = enable_cpu_mem_arena
+        self.max_length = max_length
+        self._session = None
+        self._tokenizer = None
+        self._input_names: set[str] = set()
+        LocalONNXCrossEncoder._max_concurrent = max_concurrent
+
+    @property
+    def provider_name(self) -> str:
+        return "onnx-local"
+
+    async def initialize(self) -> None:
+        if self._session is not None:
+            return
+
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            raise ImportError(
+                "onnxruntime is required for LocalONNXCrossEncoder. "
+                "Install it with: pip install onnxruntime"
+            )
+        try:
+            from tokenizers import Tokenizer
+        except ImportError:
+            raise ImportError(
+                "tokenizers is required for LocalONNXCrossEncoder. "
+                "Install it with: pip install tokenizers"
+            )
+
+        logger.info(
+            f"Reranker: initializing onnx-local provider "
+            f"(model_path={self.model_path}, tokenizer={self.tokenizer_name}, "
+            f"batch_size={self.batch_size}, intra_op={self.intra_op_num_threads}, "
+            f"inter_op={self.inter_op_num_threads}, "
+            f"bucket_batching={self.bucket_batching}, "
+            f"cpu_mem_arena={self.enable_cpu_mem_arena}, "
+            f"max_length={self.max_length}, "
+            f"max_concurrent={LocalONNXCrossEncoder._max_concurrent})"
+        )
+
+        sess_opts = ort.SessionOptions()
+        sess_opts.intra_op_num_threads = self.intra_op_num_threads
+        sess_opts.inter_op_num_threads = self.inter_op_num_threads
+        sess_opts.enable_cpu_mem_arena = self.enable_cpu_mem_arena
+        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        self._session = ort.InferenceSession(
+            self.model_path, sess_options=sess_opts, providers=["CPUExecutionProvider"]
+        )
+        self._input_names = {i.name for i in self._session.get_inputs()}
+
+        # Load tokenizer via tokenizers.Tokenizer (Rust-backed) directly from
+        # tokenizer.json, NOT via transformers.AutoTokenizer. Older transformers
+        # (e.g. 5.6.x bundled with hindsight 0.5.6 image) dispatch
+        # `tokenizer_class: LlamaTokenizer` in tokenizer_config.json to a
+        # generic slow LlamaTokenizer impl that produces different tokenization
+        # than the ModernBERT-ja fast tokenizer used by the exporter. Going
+        # straight through `tokenizers.Tokenizer.from_file()` makes tokenization
+        # transformers-version-independent. Validated against host PyTorch
+        # CrossEncoder.predict() at max_abs_diff < 1e-5 (sigmoid).
+        tokenizer_json = os.path.join(self.tokenizer_name, "tokenizer.json")
+        if not os.path.exists(tokenizer_json):
+            raise FileNotFoundError(
+                f"tokenizer.json not found at {tokenizer_json}. "
+                f"LocalONNXCrossEncoder needs the HF tokenizers JSON "
+                f"(produced by optimum-cli export onnx)."
+            )
+        self._tokenizer = Tokenizer.from_file(tokenizer_json)
+        # Padding / truncation are configured up-front so encode_batch can
+        # produce a uniform numpy matrix per call.
+        self._tokenizer.enable_padding(pad_id=0, pad_token="<pad>")
+        self._tokenizer.enable_truncation(max_length=self.max_length)
+
+        if LocalONNXCrossEncoder._executor is None:
+            LocalONNXCrossEncoder._executor = ThreadPoolExecutor(
+                max_workers=LocalONNXCrossEncoder._max_concurrent,
+                thread_name_prefix="onnx-rerank",
+            )
+            logger.info(
+                f"Reranker: onnx-local provider initialized "
+                f"(max_concurrent={LocalONNXCrossEncoder._max_concurrent})"
+            )
+        else:
+            logger.info("Reranker: onnx-local provider initialized (using existing executor)")
+
+    def _predict_sync(self, pairs: list[tuple[str, str]]) -> list[float]:
+        import numpy as np
+
+        if not pairs:
+            return []
+
+        # bucket_batching: sort by combined length to reduce padding waste.
+        # Hindsight's CrossEncoderReranker sigmoids the returned scores again
+        # (search/reranking.py), so we apply sigmoid here once to match the
+        # LocalSTCrossEncoder calibration (which goes through
+        # CrossEncoder.predict()'s default sigmoid).
+        if self.bucket_batching and len(pairs) > 1:
+            lengths = [len(pairs[i][0]) + len(pairs[i][1]) for i in range(len(pairs))]
+            sorted_indices = sorted(range(len(pairs)), key=lambda i: lengths[i])
+            sorted_pairs = [pairs[i] for i in sorted_indices]
+            sorted_scores = self._run_batches(sorted_pairs)
+            scores = [0.0] * len(pairs)
+            for new_pos, orig_idx in enumerate(sorted_indices):
+                scores[orig_idx] = sorted_scores[new_pos]
+            return scores
+
+        return self._run_batches(pairs)
+
+    def _run_batches(self, pairs: list[tuple[str, str]]) -> list[float]:
+        import numpy as np
+
+        scores: list[float] = []
+        for i in range(0, len(pairs), self.batch_size):
+            batch = pairs[i : i + self.batch_size]
+            # tokenizers.Tokenizer.encode_batch accepts list of (text, text_pair)
+            # tuples and applies padding / truncation configured in initialize().
+            encs = self._tokenizer.encode_batch(list(batch))
+            input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
+            attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
+            feeds = {}
+            if "input_ids" in self._input_names:
+                feeds["input_ids"] = input_ids
+            if "attention_mask" in self._input_names:
+                feeds["attention_mask"] = attention_mask
+            if "token_type_ids" in self._input_names:
+                feeds["token_type_ids"] = np.asarray(
+                    [e.type_ids for e in encs], dtype=np.int64
+                )
+            logits = self._session.run(None, feeds)[0].squeeze(-1)
+            batch_scores = 1.0 / (1.0 + np.exp(-logits))
+            scores.extend(batch_scores.tolist() if hasattr(batch_scores, "tolist") else list(batch_scores))
+        return scores
+
+    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        if self._session is None:
+            raise RuntimeError("Reranker not initialized. Call initialize() first.")
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            LocalONNXCrossEncoder._executor, self._predict_sync, pairs
+        )
+
+
 class LiteLLMCrossEncoder(CrossEncoderModel):
     """
     LiteLLM cross-encoder implementation using LiteLLM proxy's /rerank endpoint.
@@ -1652,7 +1834,24 @@ def create_cross_encoder_from_env() -> CrossEncoderModel:
         return RRFPassthroughCrossEncoder()
     elif provider == "jina-mlx":
         return JinaMLXCrossEncoder()
+    elif provider == "onnx-local":
+        if not config.reranker_onnx_model_path:
+            raise ValueError(
+                "HINDSIGHT_API_RERANKER_ONNX_MODEL_PATH is required when "
+                f"{ENV_RERANKER_PROVIDER} is 'onnx-local'"
+            )
+        return LocalONNXCrossEncoder(
+            model_path=config.reranker_onnx_model_path,
+            tokenizer_name=config.reranker_onnx_tokenizer_name,
+            batch_size=config.reranker_onnx_batch_size,
+            intra_op_num_threads=config.reranker_onnx_intra_op_threads,
+            inter_op_num_threads=config.reranker_onnx_inter_op_threads,
+            bucket_batching=config.reranker_onnx_bucket_batching,
+            enable_cpu_mem_arena=config.reranker_onnx_cpu_mem_arena,
+            max_concurrent=config.reranker_onnx_max_concurrent,
+            max_length=config.reranker_onnx_max_length,
+        )
     else:
         raise ValueError(
-            f"Unknown reranker provider: {provider}. Supported: 'local', 'tei', 'cohere', 'zeroentropy', 'siliconflow', 'google', 'flashrank', 'litellm', 'litellm-sdk', 'rrf', 'jina-mlx'"
+            f"Unknown reranker provider: {provider}. Supported: 'local', 'tei', 'cohere', 'zeroentropy', 'siliconflow', 'google', 'flashrank', 'litellm', 'litellm-sdk', 'rrf', 'jina-mlx', 'onnx-local'"
         )

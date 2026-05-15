@@ -269,6 +269,19 @@ ENV_RERANKER_FLASHRANK_MODEL = "HINDSIGHT_API_RERANKER_FLASHRANK_MODEL"
 ENV_RERANKER_FLASHRANK_CACHE_DIR = "HINDSIGHT_API_RERANKER_FLASHRANK_CACHE_DIR"
 ENV_RERANKER_FLASHRANK_CPU_MEM_ARENA = "HINDSIGHT_API_RERANKER_FLASHRANK_CPU_MEM_ARENA"
 
+# Local ONNX reranker — runs cross-encoder models via onnxruntime + HF tokenizers
+# directly, transformers-version-independent. Targets cross-encoder models
+# exported with optimum-cli (validated against hotchpotch/japanese-reranker-xsmall-v2).
+ENV_RERANKER_ONNX_MODEL_PATH = "HINDSIGHT_API_RERANKER_ONNX_MODEL_PATH"
+ENV_RERANKER_ONNX_TOKENIZER_NAME = "HINDSIGHT_API_RERANKER_ONNX_TOKENIZER_NAME"
+ENV_RERANKER_ONNX_BATCH_SIZE = "HINDSIGHT_API_RERANKER_ONNX_BATCH_SIZE"
+ENV_RERANKER_ONNX_INTRA_OP_THREADS = "HINDSIGHT_API_RERANKER_ONNX_INTRA_OP_THREADS"
+ENV_RERANKER_ONNX_INTER_OP_THREADS = "HINDSIGHT_API_RERANKER_ONNX_INTER_OP_THREADS"
+ENV_RERANKER_ONNX_BUCKET_BATCHING = "HINDSIGHT_API_RERANKER_ONNX_BUCKET_BATCHING"
+ENV_RERANKER_ONNX_CPU_MEM_ARENA = "HINDSIGHT_API_RERANKER_ONNX_CPU_MEM_ARENA"
+ENV_RERANKER_ONNX_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_ONNX_MAX_CONCURRENT"
+ENV_RERANKER_ONNX_MAX_LENGTH = "HINDSIGHT_API_RERANKER_ONNX_MAX_LENGTH"
+
 # ZeroEntropy configuration (reranker only)
 ENV_RERANKER_ZEROENTROPY_API_KEY = "HINDSIGHT_API_RERANKER_ZEROENTROPY_API_KEY"
 ENV_RERANKER_ZEROENTROPY_MODEL = "HINDSIGHT_API_RERANKER_ZEROENTROPY_MODEL"
@@ -534,6 +547,19 @@ DEFAULT_RERANKER_MAX_CANDIDATES = 300
 DEFAULT_RERANKER_FLASHRANK_MODEL = "ms-marco-MiniLM-L-12-v2"  # Best balance of speed and quality
 DEFAULT_RERANKER_FLASHRANK_CACHE_DIR = None  # Use default cache directory
 DEFAULT_RERANKER_FLASHRANK_CPU_MEM_ARENA = False  # Disable ONNX CPU memory arena to bound RSS
+
+# Local ONNX reranker defaults. Tuned for ModernBERT-ja sized cross-encoders
+# (e.g. hotchpotch/japanese-reranker-xsmall-v2, 36.8M params) on CPU after
+# Step 1.9 microbench (intra_op=4 + bucket sort = 1.39x vs PyTorch).
+DEFAULT_RERANKER_ONNX_MODEL_PATH = ""  # Required; container path to model.onnx
+DEFAULT_RERANKER_ONNX_TOKENIZER_NAME = ""  # Empty → use parent dir of model_path
+DEFAULT_RERANKER_ONNX_BATCH_SIZE = 2  # Step 1 sweep winner for xsmall on CPU
+DEFAULT_RERANKER_ONNX_INTRA_OP_THREADS = 4  # Step 1.9 sweet spot (Ryzen 6c/12t)
+DEFAULT_RERANKER_ONNX_INTER_OP_THREADS = 1
+DEFAULT_RERANKER_ONNX_BUCKET_BATCHING = True  # 1.23→1.39x in Step 1.9
+DEFAULT_RERANKER_ONNX_CPU_MEM_ARENA = False  # Bound RSS, same rationale as FlashRank
+DEFAULT_RERANKER_ONNX_MAX_CONCURRENT = 2  # Mirror LocalSTCrossEncoder default
+DEFAULT_RERANKER_ONNX_MAX_LENGTH = 512  # Mirror sentence-transformers default for xsmall
 
 DEFAULT_EMBEDDINGS_COHERE_MODEL = "embed-english-v3.0"
 DEFAULT_RERANKER_COHERE_MODEL = "rerank-english-v3.0"
@@ -1015,6 +1041,16 @@ class HindsightConfig:
     reranker_google_model: str
     reranker_google_project_id: str | None
     reranker_google_service_account_key: str | None
+    # ONNX (hotchpotch) reranker
+    reranker_onnx_model_path: str
+    reranker_onnx_tokenizer_name: str
+    reranker_onnx_batch_size: int
+    reranker_onnx_intra_op_threads: int
+    reranker_onnx_inter_op_threads: int
+    reranker_onnx_bucket_batching: bool
+    reranker_onnx_cpu_mem_arena: bool
+    reranker_onnx_max_concurrent: int
+    reranker_onnx_max_length: int
 
     # Server
     host: str
@@ -1654,6 +1690,34 @@ class HindsightConfig:
             or os.getenv(ENV_LLM_VERTEXAI_PROJECT_ID),
             reranker_google_service_account_key=os.getenv(ENV_RERANKER_GOOGLE_SERVICE_ACCOUNT_KEY)
             or os.getenv(ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY),
+            # ONNX (hotchpotch) reranker
+            reranker_onnx_model_path=os.getenv(ENV_RERANKER_ONNX_MODEL_PATH, DEFAULT_RERANKER_ONNX_MODEL_PATH),
+            reranker_onnx_tokenizer_name=os.getenv(
+                ENV_RERANKER_ONNX_TOKENIZER_NAME, DEFAULT_RERANKER_ONNX_TOKENIZER_NAME
+            ),
+            reranker_onnx_batch_size=int(
+                os.getenv(ENV_RERANKER_ONNX_BATCH_SIZE, str(DEFAULT_RERANKER_ONNX_BATCH_SIZE))
+            ),
+            reranker_onnx_intra_op_threads=int(
+                os.getenv(ENV_RERANKER_ONNX_INTRA_OP_THREADS, str(DEFAULT_RERANKER_ONNX_INTRA_OP_THREADS))
+            ),
+            reranker_onnx_inter_op_threads=int(
+                os.getenv(ENV_RERANKER_ONNX_INTER_OP_THREADS, str(DEFAULT_RERANKER_ONNX_INTER_OP_THREADS))
+            ),
+            reranker_onnx_bucket_batching=os.getenv(
+                ENV_RERANKER_ONNX_BUCKET_BATCHING, str(DEFAULT_RERANKER_ONNX_BUCKET_BATCHING)
+            ).lower()
+            in ("true", "1"),
+            reranker_onnx_cpu_mem_arena=os.getenv(
+                ENV_RERANKER_ONNX_CPU_MEM_ARENA, str(DEFAULT_RERANKER_ONNX_CPU_MEM_ARENA)
+            ).lower()
+            in ("true", "1"),
+            reranker_onnx_max_concurrent=int(
+                os.getenv(ENV_RERANKER_ONNX_MAX_CONCURRENT, str(DEFAULT_RERANKER_ONNX_MAX_CONCURRENT))
+            ),
+            reranker_onnx_max_length=int(
+                os.getenv(ENV_RERANKER_ONNX_MAX_LENGTH, str(DEFAULT_RERANKER_ONNX_MAX_LENGTH))
+            ),
             # Server
             host=os.getenv(ENV_HOST, DEFAULT_HOST),
             port=int(os.getenv(ENV_PORT, DEFAULT_PORT)),

@@ -161,8 +161,9 @@ class CrossEncoderReranker:
         import asyncio
 
         cross_encoder = self.cross_encoder
-        # For local providers, run in thread pool to avoid blocking event loop
-        if cross_encoder.provider_name == "local":
+        # For local providers (PyTorch / ONNX Runtime), run in thread pool to
+        # avoid blocking the event loop with model loading.
+        if cross_encoder.provider_name in {"local", "onnx-local"}:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: asyncio.run(cross_encoder.initialize()))
         else:
